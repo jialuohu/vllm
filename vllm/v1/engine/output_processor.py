@@ -38,6 +38,13 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 
+import json as _json, os as _os
+_BENCH_LOG = _os.environ.get("VLLM_BENCH_LOG")
+def _bench_log(data):
+    if _BENCH_LOG:
+        with open(_BENCH_LOG, "a") as _f:
+            _f.write(_json.dumps(data) + "\n")
+
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
@@ -806,6 +813,14 @@ class OutputProcessor:
 
         assert finish_reason is not None
         assert req_state.stats is not None
+        s = req_state.stats
+        if _BENCH_LOG and s.scheduled_ts > 0 and s.first_token_ts > 0:
+            _bench_log({"type": "finish",
+                        "ext_id": req_state.external_req_id,
+                        "int_id": req_state.request_id,
+                        "queued_ms": round((s.scheduled_ts - s.queued_ts) * 1000, 1),
+                        "prefill_ms": round((s.first_token_ts - s.scheduled_ts) * 1000, 1),
+                        "decode_ms": round((s.last_token_ts - s.first_token_ts) * 1000, 1)})
         iteration_stats.update_from_finished_request(
             finish_reason=finish_reason,
             num_prompt_tokens=req_state.prompt_len,

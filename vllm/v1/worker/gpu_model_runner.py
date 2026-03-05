@@ -48,6 +48,14 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+
+# ── bench-log helper (write encoder timing to JSONL) ──
+import os as _os, json as _json
+_BENCH_LOG = _os.environ.get("VLLM_BENCH_LOG")
+def _bench_log_gpu(data):
+    if _BENCH_LOG:
+        with open(_BENCH_LOG, "a") as _f:
+            _f.write(_json.dumps(data) + "\n")
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -2301,9 +2309,10 @@ class GPUModelRunner(
             return []
 
         should_time = bool(
-            self.observability_config
+            (self.observability_config
             and self.observability_config.enable_mm_processor_stats
-            and scheduler_output.scheduled_encoder_inputs
+            and scheduler_output.scheduled_encoder_inputs)
+            or _BENCH_LOG
         )
 
         # Batch mm inputs as much as we can: if a request in the batch has
@@ -2443,6 +2452,21 @@ class GPUModelRunner(
             self.encoder_cache[mm_hash] = output
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+        # ── write encoder timing to bench log ──
+        if _BENCH_LOG:
+            with self._encoder_timing_lock:
+                for req_id, stats in list(
+                    self.encoder_timing_registry.items()
+                ):
+                    _bench_log_gpu({
+                        "type": "encoder",
+                        "int_id": req_id,
+                        "encoder_ms": round(
+                            stats.encoder_forward_time * 1000, 1
+                        ),
+                    })
+                self.encoder_timing_registry.clear()
 
         return encoder_outputs
 

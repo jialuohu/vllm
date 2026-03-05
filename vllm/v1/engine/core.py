@@ -68,6 +68,17 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
+# ---- Bench-log helper (chunked-prefill timing) ----
+import json as _json
+_BENCH_LOG = os.environ.get("VLLM_BENCH_LOG")
+
+def _bench_log_core(data):
+    if _BENCH_LOG:
+        with open(_BENCH_LOG, "a") as _f:
+            _f.write(_json.dumps(data) + "\n")
+
+_pending_prefill: dict[int, tuple] = {}  # id(scheduler_output) -> (info, t_start)
+
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -402,6 +413,21 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        # --- Bench: identify prefill chunks in this step ---
+        _prefill_info = None
+        if _BENCH_LOG and scheduler_output.total_num_scheduled_tokens > 0:
+            _prefill_info = []
+            for req_id, n_tok in scheduler_output.num_scheduled_tokens.items():
+                req = self.scheduler.requests.get(req_id)
+                if req is None:
+                    continue
+                # _update_after_schedule already advanced num_computed_tokens
+                computed_before = req.num_computed_tokens - n_tok
+                if computed_before < req.num_prompt_tokens:
+                    _prefill_info.append((req_id, n_tok, computed_before))
+            _step_start = time.monotonic()
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -411,6 +437,19 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        # --- Bench: log prefill chunks after step completes ---
+        if _prefill_info:
+            _step_end = time.monotonic()
+            for req_id, n_tok, computed_before in _prefill_info:
+                _bench_log_core({
+                    "type": "prefill_chunk",
+                    "int_id": req_id,
+                    "t_start": round(_step_start, 6),
+                    "t_end": round(_step_end, 6),
+                    "n_tokens": n_tok,
+                    "computed_before": computed_before,
+                })
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -463,6 +502,21 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+
+            # --- Bench: identify prefill chunks at schedule time ---
+            if _BENCH_LOG and scheduler_output.total_num_scheduled_tokens > 0:
+                _pf_info = []
+                for req_id, n_tok in scheduler_output.num_scheduled_tokens.items():
+                    req = self.scheduler.requests.get(req_id)
+                    if req is None:
+                        continue
+                    computed_before = req.num_computed_tokens - n_tok
+                    if computed_before < req.num_prompt_tokens:
+                        _pf_info.append((req_id, n_tok, computed_before))
+                if _pf_info:
+                    _pending_prefill[id(scheduler_output)] = (
+                        _pf_info, time.monotonic())
+
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -517,6 +571,21 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        # --- Bench: log prefill chunks after step completes ---
+        _pf = _pending_prefill.pop(id(scheduler_output), None)
+        if _pf:
+            _pf_info, _step_start = _pf
+            _step_end = time.monotonic()
+            for req_id, n_tok, computed_before in _pf_info:
+                _bench_log_core({
+                    "type": "prefill_chunk",
+                    "int_id": req_id,
+                    "t_start": round(_step_start, 6),
+                    "t_end": round(_step_end, 6),
+                    "n_tokens": n_tok,
+                    "computed_before": computed_before,
+                })
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
